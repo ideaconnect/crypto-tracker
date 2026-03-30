@@ -2,13 +2,17 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -129,7 +133,59 @@ func loadPreviousPrices(path string) map[string]string {
 // Binance client
 // ────────────────────────────────────────────────────────────────────────────
 
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+const maxRetries = 3
+
+// isTransient returns true for errors worth retrying (timeouts, temporary
+// network errors, and HTTP 5xx responses).
+func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	// context.DeadlineExceeded, net timeouts, temporary net errors
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// Also catch the "context deadline exceeded" text that sometimes wraps
+	if strings.Contains(err.Error(), "context deadline exceeded") ||
+		strings.Contains(err.Error(), "Client.Timeout") {
+		return true
+	}
+	return false
+}
+
+// retryGet performs an HTTP GET with exponential backoff on transient errors.
+func retryGet(url string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<(attempt-1)) * time.Second // 1s, 2s, 4s
+			log.Printf("WARN: retry %d/%d after %s for %s", attempt, maxRetries, backoff, url)
+			time.Sleep(backoff)
+		}
+
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			if isTransient(err) {
+				lastErr = err
+				continue
+			}
+			return nil, err // non-transient: give up immediately
+		}
+
+		// Retry on 5xx server errors
+		if resp.StatusCode >= 500 {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+
+		return resp, nil
+	}
+	return nil, fmt.Errorf("all %d retries exhausted: %w", maxRetries, lastErr)
+}
 
 // fetchTicker calls GET /api/v3/ticker for the given symbols and windowSize.
 // Binance accepts multiple symbols as a JSON array in a single request.
@@ -147,7 +203,7 @@ func fetchTicker(symbols []string, windowSize string) ([]binanceTicker, error) {
 
 	reqURL := fmt.Sprintf("%s/api/v3/ticker?%s", binanceBaseURL, params.Encode())
 
-	resp, err := httpClient.Get(reqURL)
+	resp, err := retryGet(reqURL)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP GET: %w", err)
 	}
@@ -191,23 +247,50 @@ func runOnce(outputPath string) error {
 		}
 	}
 
-	// One API call per timeframe – all three symbols in each request.
-	for _, tf := range timeframes {
-		tickers, err := fetchTicker(trackedSymbols, tf.windowSize)
-		if err != nil {
-			// Network/API failure: bail out without writing the file.
-			return fmt.Errorf("fetch %s window: %w", tf.label, err)
-		}
+	// Fetch all timeframes concurrently to reduce wall-clock time.
+	type tfResult struct {
+		label   string
+		tickers []binanceTicker
+	}
 
-		for _, t := range tickers {
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+		results  []tfResult
+	)
+
+	for _, tf := range timeframes {
+		wg.Add(1)
+		go func(windowSize, label string) {
+			defer wg.Done()
+			tickers, err := fetchTicker(trackedSymbols, windowSize)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("fetch %s window: %w", label, err)
+				}
+				return
+			}
+			results = append(results, tfResult{label: label, tickers: tickers})
+		}(tf.windowSize, tf.label)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+
+	for _, res := range results {
+		for _, t := range res.tickers {
 			pair, ok := summary.Pairs[t.Symbol]
 			if !ok {
 				continue
 			}
-			// All windows share the same close price; last write wins.
 			pair.CurrentPrice = t.LastPrice
-			pair.OpenPrices[tf.label] = t.OpenPrice
-			pair.Changes[tf.label] = ChangeInfo{
+			pair.OpenPrices[res.label] = t.OpenPrice
+			pair.Changes[res.label] = ChangeInfo{
 				PriceChange:        t.PriceChange,
 				PriceChangePercent: t.PriceChangePercent,
 			}
